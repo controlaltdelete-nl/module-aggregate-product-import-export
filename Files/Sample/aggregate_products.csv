@@ -1,0 +1,4 @@
+sku,store_view_code,attribute_set_code,product_type,name,price,product_online,aggregate_children
+child-simple-a,,Default,simple,Child Product A,5.00,1,
+child-simple-b,,Default,simple,Child Product B,8.00,1,
+aggregate-kit-001,,Default,aggregate,Starter Kit,24.99,1,"child-simple-a=2,child-simple-b=3"

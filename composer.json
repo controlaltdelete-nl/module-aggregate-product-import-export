@@ -1,0 +1,23 @@
+{
+    "name": "nfourteen/module-aggregate-product-import-export",
+    "description": "Import/export support for aggregate product child links via CSV.",
+    "type": "magento2-module",
+    "require": {
+        "php": ">=8.3",
+        "magento/framework": "*",
+        "magento/module-import-export": "*",
+        "magento/module-catalog-import-export": "*",
+        "nfourteen/module-aggregate-product": "*"
+    },
+    "license": [
+        "Proprietary"
+    ],
+    "autoload": {
+        "files": [
+            "registration.php"
+        ],
+        "psr-4": {
+            "Nfourteen\\AggregateProductImportExport\\": ""
+        }
+    }
+}

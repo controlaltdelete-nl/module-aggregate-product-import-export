@@ -1,0 +1,14 @@
+<?xml version="1.0"?>
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="urn:magento:framework:ObjectManager/etc/config.xsd">
+    <type name="Magento\CatalogImportExport\Model\Export\RowCustomizer\Composite">
+        <arguments>
+            <argument name="customizers" xsi:type="array">
+                <item name="aggregateProduct" xsi:type="string">Nfourteen\AggregateProductImportExport\Model\Export\RowCustomizer</item>
+            </argument>
+        </arguments>
+    </type>
+    <type name="Magento\CatalogImportExport\Model\StockItemImporterInterface">
+        <plugin name="update_aggregate_product_stock_status_plugin"
+                type="Nfourteen\AggregateProductImportExport\Plugin\StockItemImporter\UpdateAggregateStockStatusPlugin" />
+    </type>
+</config>
