@@ -7,6 +7,7 @@ declare(strict_types=1);
 
 namespace Nfourteen\AggregateProductImportExport\Model\Import\Product\Type;
 
+use InvalidArgumentException;
 use Magento\Catalog\Model\ResourceModel\Product\Attribute\CollectionFactory as ProductAttributeCollectionFactory;
 use Magento\CatalogImportExport\Model\Import\Product;
 use Magento\CatalogImportExport\Model\Import\Product\SkuStorage;
@@ -14,10 +15,12 @@ use Magento\CatalogImportExport\Model\Import\Product\Type\AbstractType;
 use Magento\Eav\Model\ResourceModel\Entity\Attribute\Set\CollectionFactory as AttributeSetCollectionFactory;
 use Magento\Framework\App\ObjectManager;
 use Magento\Framework\App\ResourceConnection;
+use Magento\Framework\Exception\LocalizedException;
 use Nfourteen\AggregateProduct\Api\Data\RelationMetadataInterfaceFactory;
 use Nfourteen\AggregateProduct\Model\Product\AllowedChildTypes;
 use Nfourteen\AggregateProduct\Model\RelationReindexer;
 use Nfourteen\AggregateProduct\Model\ResourceModel\RelationMetadata as RelationMetadataResource;
+use Throwable;
 
 class Aggregate extends AbstractType
 {
@@ -45,6 +48,9 @@ class Aggregate extends AbstractType
     private array $allowedProductTypes;
 
     private SkuStorage $skuStorage;
+
+    /** @var array<string, string>|null lowercased SKU => product type of every row in the file */
+    private ?array $productTypesInFile = null;
 
     public function __construct(
         AttributeSetCollectionFactory $attrSetColFac,
@@ -93,9 +99,12 @@ class Aggregate extends AbstractType
                 $valid = false;
             }
 
-            $resolution = $this->resolveChild($sku, $newSku);
-            if (($resolution['error'] ?? null) === self::ERROR_INVALID_CHILD_TYPE) {
-                $this->_entityModel->addRowError(self::ERROR_INVALID_CHILD_TYPE, $rowNum, self::COLUMN_NAME);
+            $error = $this->resolveChild($sku, $newSku)['error'] ?? null;
+            if ($error === self::ERROR_CHILD_NOT_FOUND) {
+                $error = $this->validateChildFurtherDownTheFile($sku);
+            }
+            if ($error !== null) {
+                $this->_entityModel->addRowError($error, $rowNum, self::COLUMN_NAME);
                 $valid = false;
             }
         }
@@ -113,25 +122,7 @@ class Aggregate extends AbstractType
                 continue;
             }
 
-            $relations = [];
-            foreach ($parents as $parentId => $links) {
-                // Replace semantics: clear the parent's current children (and their mirrored
-                // catalog_product_relation rows) before persisting the desired set. An empty $links
-                // set therefore removes every child.
-                $this->relationMetadataResource->deleteByParentId($parentId);
-
-                foreach ($links as $link) {
-                    $relation = $this->relationMetadataFactory->create();
-                    $relation->setParentId($parentId);
-                    $relation->setProductId($link['product_id']);
-                    $relation->setQty($link['qty']);
-                    $relations[] = $relation;
-                }
-            }
-
-            if (!empty($relations)) {
-                $this->relationMetadataResource->saveAggregateLinks($relations);
-            }
+            $this->replaceLinks($parents);
 
             // On-save index mode has no mview triggers on the link table, so the reindex must
             // happen here; in scheduled mode it no-ops and the mview subscriptions take over.
@@ -142,8 +133,45 @@ class Aggregate extends AbstractType
     }
 
     /**
+     * Replace semantics: clear each parent's current children (and their mirrored
+     * catalog_product_relation rows) before persisting the desired set. An empty link set therefore
+     * removes every child. Runs in one transaction, so a failure leaves every pack as it was.
+     *
+     * @param array<int, array<int, array{product_id: int, qty: float}>> $parents parentId => links
+     */
+    private function replaceLinks(array $parents): void
+    {
+        $relations = [];
+        foreach ($parents as $parentId => $links) {
+            foreach ($links as $link) {
+                $relation = $this->relationMetadataFactory->create();
+                $relation->setParentId($parentId);
+                $relation->setProductId($link['product_id']);
+                $relation->setQty($link['qty']);
+                $relations[] = $relation;
+            }
+        }
+
+        $connection = $this->relationMetadataResource->getConnection();
+        $connection->beginTransaction();
+        try {
+            foreach (array_keys($parents) as $parentId) {
+                $this->relationMetadataResource->deleteByParentId($parentId);
+            }
+            if ($relations !== []) {
+                $this->relationMetadataResource->saveAggregateLinks($relations);
+            }
+            $connection->commit();
+        } catch (Throwable $e) {
+            $connection->rollBack();
+            throw $e;
+        }
+    }
+
+    /**
      * Resolve every aggregate parent referenced in the bunch to its desired child link set.
-     * Invalid children are dropped with a row error rather than silently skipped.
+     * A parent with a child that cannot be resolved gets a row error and is left out entirely, so
+     * its existing links stay as they are instead of being replaced by a partial set.
      *
      * @param array<int|string, array<string, mixed>> $bunch
      * @param array<string, array<string, mixed>> $newSku
@@ -181,12 +209,14 @@ class Aggregate extends AbstractType
 
             // Present-but-empty value -> delete all children (links stays empty).
             $links = [];
+            $isResolved = true;
             $aggregateChildren = $rowData[self::COLUMN_NAME];
             if ($aggregateChildren !== '' && $aggregateChildren !== null) {
                 foreach ($this->normalizeSkusAndQty($aggregateChildren) as $childSku => $qty) {
                     $resolution = $this->resolveChild((string)$childSku, $newSku);
                     if (isset($resolution['error'])) {
                         $this->_entityModel->addRowError($resolution['error'], $rowNum, self::COLUMN_NAME);
+                        $isResolved = false;
                         continue;
                     }
 
@@ -194,7 +224,9 @@ class Aggregate extends AbstractType
                 }
             }
 
-            $parents[$parentId] = $links;
+            if ($isResolved) {
+                $parents[$parentId] = $links;
+            }
         }
 
         return $parents;
@@ -245,6 +277,75 @@ class Aggregate extends AbstractType
         }
 
         return $result;
+    }
+
+    /**
+     * Rows are validated one at a time, so a child created further down the same file is not
+     * known yet when its parent is validated. Only a SKU that is in neither the catalog nor the
+     * file is a typo, and a child from the file still has to be of an allowed type.
+     */
+    private function validateChildFurtherDownTheFile(string $sku): ?string
+    {
+        $typesInFile = $this->getProductTypesInFile();
+        if ($typesInFile === null) {
+            return null;
+        }
+        if (!array_key_exists($sku, $typesInFile)) {
+            return self::ERROR_CHILD_NOT_FOUND;
+        }
+
+        $type = $typesInFile[$sku];
+        if ($type !== '' && !in_array($type, $this->allowedProductTypes, true)) {
+            return self::ERROR_INVALID_CHILD_TYPE;
+        }
+
+        return null;
+    }
+
+    /**
+     * Reads the SKU and product type columns of the whole file once, then puts the source back on
+     * the row that is being validated.
+     *
+     * The admin imports in a later request than "Check Data", from the rows stored when the file was
+     * validated; there is no file to read then. Those rows already passed this check, and the save
+     * step still leaves a pack alone when one of its children cannot be resolved.
+     *
+     * @return array<string, string>|null lowercased SKU => product type ('' when no row sets one),
+     *                                     or null when no file is being validated
+     */
+    private function getProductTypesInFile(): ?array
+    {
+        if ($this->productTypesInFile !== null) {
+            return $this->productTypesInFile;
+        }
+
+        try {
+            $source = $this->_entityModel->getSource();
+        } catch (LocalizedException $e) {
+            return null;
+        }
+        $position = $source->key();
+        $this->productTypesInFile = [];
+        for ($source->rewind(); $source->valid(); $source->next()) {
+            try {
+                $row = $source->current();
+            } catch (InvalidArgumentException $e) {
+                continue;
+            }
+            $sku = strtolower(trim((string)($row[Product::COL_SKU] ?? '')));
+            if ($sku === '') {
+                continue;
+            }
+            $type = (string)($row[Product::COL_TYPE] ?? '');
+            if (($this->productTypesInFile[$sku] ?? '') === '') {
+                $this->productTypesInFile[$sku] = $type;
+            }
+        }
+        // A source read to the end no longer knows where it was, so seek from the start.
+        $source->rewind();
+        $source->seek($position);
+
+        return $this->productTypesInFile;
     }
 
     /**

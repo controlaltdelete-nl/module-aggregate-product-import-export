@@ -175,16 +175,94 @@ class ImportAggregateChildrenTest extends TestCase
         $this->assertEquals(5.0, (float)$linksByChildSku['child-simple-existing']['qty']);
     }
 
-    public function testImportSkipsInvalidChildSku(): void
+    public function testImportRejectsUnknownChildSku(): void
     {
         $importer = $this->createImporter(__DIR__ . '/_files/aggregate_import_invalid_child_sku.csv');
         $errors = $importer->validateData();
-        $this->assertEquals(0, $errors->getErrorsCount(), 'Validation passes — unknown SKU is silently skipped during save');
-        $importer->importData();
-        $this->importedProducts = ['agg-parent-1'];
+        $this->assertGreaterThan(0, $errors->getErrorsCount(), 'Import validation should fail for an unknown child SKU');
+        $this->assertValidationErrorMessage($errors, 'Aggregate child SKU was not found');
+    }
 
-        $links = $this->getAggregateLinks('agg-parent-1');
-        $this->assertEmpty($links, 'No links should be created for nonexistent child SKU');
+    public function testImportAcceptsChildrenListedBelowTheirParent(): void
+    {
+        $importer = $this->createImporter(__DIR__ . '/_files/aggregate_import_children_below_parent.csv');
+        $errors = $importer->validateData();
+        $this->assertEquals(0, $errors->getErrorsCount(), 'A child created further down the same file is not unknown');
+        $importer->importData();
+        $this->importedProducts = ['child-simple-1', 'child-simple-2', 'agg-parent-1'];
+
+        $this->assertSame(
+            ['child-simple-1' => 2.0, 'child-simple-2' => 3.0],
+            $this->getLinkQtyByChildSku('agg-parent-1')
+        );
+    }
+
+    /**
+     * The admin validates the file in one request and imports the stored rows in the next, with no
+     * file attached to the importer any more. The SKUs are used by no other test, because the SKU
+     * processor keeps the ids of earlier tests' products and would resolve the children early.
+     */
+    public function testImportOfStoredRowsLinksChildrenFromTheSameFile(): void
+    {
+        $validator = $this->createImporter(__DIR__ . '/_files/aggregate_import_stored_rows.csv');
+        $this->assertEquals(0, $validator->validateData()->getErrorsCount(), 'Import validation should pass');
+
+        $this->createImporterForStoredRows()->importData();
+        $this->importedProducts = ['child-stored-rows-1', 'child-stored-rows-2', 'agg-parent-stored-rows'];
+
+        $this->assertSame(
+            ['child-stored-rows-1' => 2.0, 'child-stored-rows-2' => 3.0],
+            $this->getLinkQtyByChildSku('agg-parent-stored-rows')
+        );
+    }
+
+    #[
+        DataFixture(ProductFixture::class, ['sku' => 'child-simple-kept', 'price' => 10.0], as: 'kept'),
+        DataFixture(ProductFixture::class, ['sku' => 'child-simple-also-kept', 'price' => 10.0], as: 'alsoKept'),
+        DataFixture(AggregateProductFixture::class, [
+            'sku' => 'agg-parent-typo',
+            '_children' => [
+                ['product_id' => '$kept.id$', 'qty' => 2],
+                ['product_id' => '$alsoKept.id$', 'qty' => 3],
+            ],
+        ]),
+    ]
+    public function testImportWithUnknownChildSkuKeepsExistingLinks(): void
+    {
+        $importer = $this->createImporter(__DIR__ . '/_files/aggregate_import_unknown_child_keeps_links.csv');
+        $errors = $importer->validateData();
+        $this->assertValidationErrorMessage($errors, 'Aggregate child SKU was not found');
+        $importer->importData();
+
+        $this->assertSame(
+            ['child-simple-also-kept' => 3.0, 'child-simple-kept' => 2.0],
+            $this->getLinkQtyByChildSku('agg-parent-typo'),
+            'A row with an unknown child must leave the existing links untouched'
+        );
+    }
+
+    #[
+        DataFixture(ProductFixture::class, ['sku' => 'child-simple-guarded', 'price' => 10.0], as: 'guarded'),
+        DataFixture(AggregateProductFixture::class, [
+            'sku' => 'agg-parent-guard',
+            '_children' => [
+                ['product_id' => '$guarded.id$', 'qty' => 2],
+            ],
+        ]),
+    ]
+    public function testImportRejectsChildOfDisallowedTypeListedBelowItsParent(): void
+    {
+        $importer = $this->createImporter(__DIR__ . '/_files/aggregate_import_disallowed_child_below_parent.csv');
+        $errors = $importer->validateData();
+        $this->assertValidationErrorMessage($errors, 'Aggregate child product type is invalid');
+        $importer->importData();
+        $this->importedProducts = ['child-configurable-below'];
+
+        $this->assertSame(
+            ['child-simple-guarded' => 2.0],
+            $this->getLinkQtyByChildSku('agg-parent-guard'),
+            'The pack must not be rewritten with only the children that are allowed'
+        );
     }
 
     #[DataFixture(ProductFixture::class, ['sku' => 'child-simple-1', 'price' => 10.0])]
@@ -240,6 +318,14 @@ class ImportAggregateChildrenTest extends TestCase
         return $productImporter;
     }
 
+    private function createImporterForStoredRows(): Product
+    {
+        return $this->productImporterFactory->create()->setParameters([
+            'behavior' => Import::BEHAVIOR_ADD_UPDATE,
+            'entity' => CatalogProduct::ENTITY,
+        ]);
+    }
+
     /**
      * @return array<int, array{parent_id: string, product_id: string, qty: string, child_sku: string}>
      */
@@ -275,6 +361,20 @@ class ImportAggregateChildrenTest extends TestCase
             ->where('link.parent_id = ?', $parentId);
 
         return $connection->fetchAll($select);
+    }
+
+    /**
+     * @return array<string, float> child SKU => qty, sorted by SKU
+     */
+    private function getLinkQtyByChildSku(string $parentSku): array
+    {
+        $qtyBySku = array_map(
+            static fn (array $link): float => (float)$link['qty'],
+            $this->indexLinksByChildSku($this->getAggregateLinks($parentSku))
+        );
+        ksort($qtyBySku);
+
+        return $qtyBySku;
     }
 
     /**

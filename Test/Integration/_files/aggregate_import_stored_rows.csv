@@ -1,0 +1,4 @@
+sku,store_view_code,attribute_set_code,product_type,name,price,product_online,tax_class_name,visibility,aggregate_children
+child-stored-rows-1,,Default,simple,Child Stored Rows 1,10.00,1,Taxable Goods,"Catalog, Search",
+child-stored-rows-2,,Default,simple,Child Stored Rows 2,20.00,1,Taxable Goods,"Catalog, Search",
+agg-parent-stored-rows,,Default,aggregate,Aggregate Parent Stored Rows,30.00,1,Taxable Goods,"Catalog, Search","child-stored-rows-1=2,child-stored-rows-2=3"
